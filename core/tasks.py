@@ -8,7 +8,7 @@ from utils.logger import setup_logger
 from utils.config import get_config, get_userData
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
-from playwright.sync_api import Response
+from playwright.sync_api import Response, TimeoutError as PlaywrightTimeoutError
 
 
 complates = {}
@@ -2200,6 +2200,11 @@ def get_button_debug_info(button):
             (el) => {
                 const button = el.closest('button') || el;
                 const style = window.getComputedStyle(button);
+                const rect = button.getBoundingClientRect();
+                const hit = document.elementFromPoint(
+                    rect.left + rect.width / 2,
+                    rect.top + rect.height / 2
+                );
 
                 return JSON.stringify({
                     tag: button.tagName,
@@ -2209,10 +2214,18 @@ def get_button_debug_info(button):
                     ariaDisabled: button.getAttribute('aria-disabled'),
                     pointerEvents: style.pointerEvents,
                     opacity: style.opacity,
-                    rect: (() => {
-                        const r = button.getBoundingClientRect();
-                        return { x: r.x, y: r.y, width: r.width, height: r.height };
-                    })()
+                    rect: {
+                        x: rect.x,
+                        y: rect.y,
+                        width: rect.width,
+                        height: rect.height
+                    },
+                    hitInsideButton: !!hit && button.contains(hit),
+                    hitTarget: hit ? {
+                        tag: hit.tagName,
+                        className: String(hit.className || ''),
+                        text: (hit.innerText || '').trim().slice(0, 40)
+                    } : null
                 });
             }
             """
@@ -2262,14 +2275,75 @@ def dispatch_button_events(button):
     )
 
 
-def click_send_or_press_enter(page, account_username, friend_name, chat_input=None):
-    """
-    Hard send strategy.
+class SendActionNotStarted(RuntimeError):
+    """Raised while it is still safe to abort without confirming a send."""
 
-    1. Click the real button.chat-btn by coordinates.
-    2. If not cleared, use Playwright locator click.
-    3. If not cleared, dispatch pointer/mouse events.
-    4. If not cleared, focus the editor and press Enter.
+
+def ensure_expected_chat_input(chat_input, expected_message):
+    """Prevent a send when React changed or cleared the editor."""
+    if chat_input is None:
+        raise SendActionNotStarted("聊天输入框不可用，禁止执行发送动作")
+
+    actual_message = normalize_chat_text(get_editable_text(chat_input))
+    expected_message = normalize_chat_text(expected_message)
+
+    if not expected_message or actual_message != expected_message:
+        raise SendActionNotStarted(
+            "发送前输入框内容与预期消息不一致，禁止执行发送动作"
+        )
+
+
+def plan_single_send(button, chat_input, expected_message):
+    """
+    Select exactly one real send action without triggering a send.
+
+    Playwright's trial click runs the normal actionability checks, including
+    whether the button can receive pointer events, but skips the click itself.
+    """
+    ensure_expected_chat_input(chat_input, expected_message)
+
+    try:
+        button.click(trial=True, timeout=3000)
+        return "locator_button", "发送按钮已通过可操作性检查"
+    except PlaywrightTimeoutError as exc:
+        return (
+            "enter",
+            f"发送按钮未通过可操作性检查: {type(exc).__name__}",
+        )
+    except Exception as exc:
+        raise SendActionNotStarted(
+            f"发送按钮可操作性检查异常: {type(exc).__name__}"
+        ) from exc
+
+
+def dispatch_single_send(button, chat_input, expected_message, method):
+    """Execute one, and only one, potentially sending action."""
+    ensure_expected_chat_input(chat_input, expected_message)
+
+    if method == "locator_button":
+        button.click(timeout=5000)
+        return
+
+    if method == "enter":
+        chat_input.press("Enter", timeout=5000)
+        return
+
+    raise ValueError(f"未知发送方式: {method}")
+
+
+def click_send_or_press_enter(
+    page,
+    account_username,
+    friend_name,
+    chat_input=None,
+    expected_message=None,
+):
+    """
+    Plan and execute a single send action.
+
+    Once a real action starts, never try another method. A Playwright action
+    can throw after dispatching its event, so falling back at that point can
+    duplicate a message.
     """
 
     button = None
@@ -2286,54 +2360,36 @@ def click_send_or_press_enter(page, account_username, friend_name, chat_input=No
         logger.error(f"账号 {account_username} 未找到可用发送按钮")
         return None
 
-    logger.info(f"账号 {account_username} 发送按钮状态: {get_button_debug_info(button)}")
-
-    # Strategy 1: real mouse coordinate click on the actual button.
     try:
-        button.scroll_into_view_if_needed(timeout=3000)
-        box = button.bounding_box()
-
-        if box:
-            x = box["x"] + box["width"] / 2
-            y = box["y"] + box["height"] / 2
-            page.mouse.move(x, y)
-            time.sleep(0.2)
-            page.mouse.down()
-            time.sleep(0.15)
-            page.mouse.up()
-            logger.info(f"账号 {account_username} 已用鼠标坐标点击发送按钮: {friend_name}")
-            return "mouse_button"
-    except Exception:
-        logger.exception(f"账号 {account_username} 鼠标坐标点击发送按钮失败")
-
-    # Strategy 2: Playwright button click.
-    try:
-        button.click(timeout=5000, force=True)
-        logger.info(f"账号 {account_username} 已用 locator.click 点击发送按钮: {friend_name}")
-        return "locator_button"
-    except Exception:
-        logger.exception(f"账号 {account_username} locator.click 发送按钮失败")
-
-    # Strategy 3: dispatch events.
-    try:
-        dispatch_button_events(button)
-        logger.info(f"账号 {account_username} 已用 JS 事件触发发送按钮: {friend_name}")
-        return "dispatch_button"
-    except Exception:
-        logger.exception(f"账号 {account_username} JS 事件触发发送按钮失败")
-
-    # Strategy 4: focus input and press Enter.
-    try:
-        if chat_input is not None:
-            chat_input.click(timeout=5000)
-            time.sleep(0.2)
-
-        page.keyboard.press("Enter")
-        logger.info(f"账号 {account_username} 已聚焦输入框并按 Enter 发送: {friend_name}")
-        return "enter"
-    except Exception:
-        logger.exception(f"账号 {account_username} Enter 发送失败")
+        method, reason = plan_single_send(
+            button,
+            chat_input,
+            expected_message,
+        )
+    except SendActionNotStarted as exc:
+        logger.error(f"账号 {account_username} {exc}")
         return None
+
+    logger.info(f"账号 {account_username} 发送按钮状态: {get_button_debug_info(button)}")
+    logger.info(
+        f"账号 {account_username} 发送动作规划: {method}，原因: {reason}"
+    )
+
+    try:
+        dispatch_single_send(button, chat_input, expected_message, method)
+        logger.info(
+            f"账号 {account_username} 已执行唯一发送动作 {method}: {friend_name}"
+        )
+        return method
+    except SendActionNotStarted as exc:
+        logger.error(f"账号 {account_username} {exc}")
+        return None
+    except Exception:
+        logger.exception(
+            f"账号 {account_username} 发送动作 {method} 抛出异常，"
+            "动作结果不确定，不再尝试其他发送方式"
+        )
+        return f"{method}_ambiguous"
 
 
 def wait_input_cleared(chat_input, timeout=12000):
@@ -2625,6 +2681,7 @@ def send_message_to_friend(page, account_username, friend_name, message):
         account_username,
         friend_name,
         chat_input=chat_input,
+        expected_message=message,
     )
 
     if not send_method:
