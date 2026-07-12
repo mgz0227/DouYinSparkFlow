@@ -561,6 +561,9 @@ class RunTasksTests(unittest.TestCase):
     def setUp(self):
         self.playwright = MagicMock()
         self.browser = MagicMock()
+        self.chrome_process_guard = MagicMock()
+        self.chrome_process_guard.capture_before_close.return_value = []
+        self.chrome_process_guard.cleanup.return_value = []
         self.users = [
             {
                 "username": "first",
@@ -581,7 +584,11 @@ class RunTasksTests(unittest.TestCase):
             patch.object(
                 tasks,
                 "get_browser",
-                return_value=(self.playwright, self.browser),
+                return_value=(
+                    self.playwright,
+                    self.browser,
+                    self.chrome_process_guard,
+                ),
             ),
             patch.object(tasks, "userData", self.users),
             patch.object(
@@ -607,6 +614,8 @@ class RunTasksTests(unittest.TestCase):
             ],
         )
         self.browser.close.assert_called_once_with()
+        self.chrome_process_guard.capture_before_close.assert_called_once_with()
+        self.chrome_process_guard.cleanup.assert_called_once_with()
         self.playwright.stop.assert_called_once_with()
 
     def test_all_accounts_succeed(self):
@@ -614,7 +623,11 @@ class RunTasksTests(unittest.TestCase):
             patch.object(
                 tasks,
                 "get_browser",
-                return_value=(self.playwright, self.browser),
+                return_value=(
+                    self.playwright,
+                    self.browser,
+                    self.chrome_process_guard,
+                ),
             ),
             patch.object(tasks, "userData", self.users),
             patch.object(tasks, "do_user_task"),
@@ -624,6 +637,8 @@ class RunTasksTests(unittest.TestCase):
 
         self.assertEqual(do_user_task.call_count, 2)
         self.browser.close.assert_called_once_with()
+        self.chrome_process_guard.capture_before_close.assert_called_once_with()
+        self.chrome_process_guard.cleanup.assert_called_once_with()
         self.playwright.stop.assert_called_once_with()
 
     def test_cleanup_error_does_not_mask_account_failure(self):
@@ -633,7 +648,11 @@ class RunTasksTests(unittest.TestCase):
             patch.object(
                 tasks,
                 "get_browser",
-                return_value=(self.playwright, self.browser),
+                return_value=(
+                    self.playwright,
+                    self.browser,
+                    self.chrome_process_guard,
+                ),
             ),
             patch.object(tasks, "userData", self.users[:1]),
             patch.object(
@@ -648,6 +667,66 @@ class RunTasksTests(unittest.TestCase):
             ):
                 tasks.runTasks()
 
+        self.chrome_process_guard.capture_before_close.assert_called_once_with()
+        self.chrome_process_guard.cleanup.assert_called_once_with()
+        self.playwright.stop.assert_called_once_with()
+
+    def test_chrome_cleanup_error_fails_successful_run(self):
+        self.chrome_process_guard.cleanup.side_effect = RuntimeError(
+            "chrome remained"
+        )
+
+        with applied_patches(
+            patch.object(
+                tasks,
+                "get_browser",
+                return_value=(
+                    self.playwright,
+                    self.browser,
+                    self.chrome_process_guard,
+                ),
+            ),
+            patch.object(tasks, "userData", self.users[:1]),
+            patch.object(tasks, "do_user_task"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "清理本次 Chrome 进程失败: chrome remained",
+            ):
+                tasks.runTasks()
+
+        self.browser.close.assert_called_once_with()
+        self.playwright.stop.assert_called_once_with()
+
+    def test_chrome_cleanup_error_does_not_mask_account_failure(self):
+        self.chrome_process_guard.cleanup.side_effect = RuntimeError(
+            "chrome remained"
+        )
+
+        with applied_patches(
+            patch.object(
+                tasks,
+                "get_browser",
+                return_value=(
+                    self.playwright,
+                    self.browser,
+                    self.chrome_process_guard,
+                ),
+            ),
+            patch.object(tasks, "userData", self.users[:1]),
+            patch.object(
+                tasks,
+                "do_user_task",
+                side_effect=RuntimeError("send failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "first: RuntimeError: send failed",
+            ):
+                tasks.runTasks()
+
+        self.browser.close.assert_called_once_with()
         self.playwright.stop.assert_called_once_with()
 
 

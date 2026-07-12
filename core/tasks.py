@@ -1431,7 +1431,7 @@ def do_user_task(browser, account_username, cookies, targets):
 
 
 def runTasks():
-    playwright, browser = get_browser()
+    playwright, browser, chrome_process_guard = get_browser()
     failures = []
     primary_error = None
 
@@ -1482,9 +1482,31 @@ def runTasks():
         cleanup_errors = []
 
         try:
+            tracked_processes = chrome_process_guard.capture_before_close()
+            tracked_pids = sorted(
+                process.pid
+                for process in tracked_processes
+            )
+            logger.info(f"任务结束前记录本次 Chrome 进程: {tracked_pids}")
+        except Exception as exc:
+            cleanup_errors.append(f"记录本次 Chrome 进程失败: {exc}")
+
+        try:
             browser.close()
         except Exception as exc:
             cleanup_errors.append(f"关闭浏览器失败: {exc}")
+
+        try:
+            terminated_pids = chrome_process_guard.cleanup()
+
+            if terminated_pids:
+                logger.info(
+                    f"已清理本次运行残留的 Chrome 进程: {terminated_pids}"
+                )
+            else:
+                logger.info("本次运行的 Chrome 进程已全部退出")
+        except Exception as exc:
+            cleanup_errors.append(f"清理本次 Chrome 进程失败: {exc}")
 
         try:
             playwright.stop()

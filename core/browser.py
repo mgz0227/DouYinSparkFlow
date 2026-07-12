@@ -3,6 +3,7 @@ import sys
 import shutil
 import traceback
 from playwright.sync_api import sync_playwright
+from core.chrome_processes import ChromeProcessGuard
 from utils.config import DEBUG, get_environment, Environment
 
 
@@ -67,8 +68,11 @@ def get_browser():
     """
     启动浏览器实例
 
-    :return: playwright, browser
+    :return: playwright, browser, chrome_process_guard
     """
+    playwright = None
+    browser = None
+    chrome_process_guard = ChromeProcessGuard()
 
     try:
         # 不使用 Playwright 自己下载的 Chromium
@@ -87,6 +91,7 @@ def get_browser():
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
+            chrome_process_guard.launch_argument,
         ]
 
         # root 用户运行 Chrome 时通常必须加 --no-sandbox
@@ -112,8 +117,39 @@ def get_browser():
                 args=launch_args,
             )
 
-        return playwright, browser
+        owned_processes = chrome_process_guard.capture_after_launch()
+        owned_pids = sorted(process.pid for process in owned_processes)
+        print(f"已记录本次 Chrome 进程：{owned_pids}")
 
-    except Exception:
+        return playwright, browser, chrome_process_guard
+
+    except BaseException:
         traceback.print_exc()
-        sys.exit(1)
+        cleanup_errors = []
+
+        try:
+            chrome_process_guard.capture_before_close()
+        except Exception as exc:
+            cleanup_errors.append(f"记录启动中的 Chrome 进程失败: {exc}")
+
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception as exc:
+                cleanup_errors.append(f"关闭启动中的浏览器失败: {exc}")
+
+        try:
+            chrome_process_guard.cleanup()
+        except Exception as exc:
+            cleanup_errors.append(f"清理启动中的 Chrome 进程失败: {exc}")
+
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception as exc:
+                cleanup_errors.append(f"停止启动中的 Playwright 失败: {exc}")
+
+        if cleanup_errors:
+            print("；".join(cleanup_errors), file=sys.stderr)
+
+        raise
