@@ -3,6 +3,7 @@ import re
 import time
 import json
 import traceback
+from collections import deque
 
 from utils.logger import setup_logger
 from utils.config import get_config, get_userData
@@ -2443,10 +2444,423 @@ CHAT_REJECTION_TIP_SELECTOR = (
     "div[class*='box-item-'][class*='tip-']:visible"
 )
 SEND_BASELINE_ATTRIBUTE = "data-dysf-send-baseline"
+CONFER_PERMISSION_CHECK_PATH = "/aweme/v1/creator/confer/permission/check/"
+SEND_DIAGNOSTIC_WINDOW_KEY = "__dysfSendDiagnostic"
+SEND_BUTTON_EVENT_TYPES = ("pointerdown", "pointerup", "click")
+SEND_DIAGNOSTIC_STATUS_MSG_LIMIT = 160
 
 
 class MessageSendNotConfirmed(RuntimeError):
     """Raised when the page never exposes a successful outgoing message state."""
+
+
+class SendAttemptDiagnosticMonitor:
+    """Observe one send attempt without issuing requests or input actions."""
+
+    def __init__(self, page):
+        self.page = page
+        self.permission_state = "not_observed"
+        self.permission_request_count = 0
+        self.http_status = None
+        self.status_code = None
+        self.check_result = None
+        self.status_msg = ""
+        self.button_events = {
+            event_type: {"count": 0, "is_trusted": False}
+            for event_type in SEND_BUTTON_EVENT_TYPES
+        }
+        self._permission_events = deque()
+        self._permission_requests = {}
+        self._latest_permission_request_key = None
+        self._listeners = []
+        self._started = False
+
+    @staticmethod
+    def _is_permission_check(url):
+        return CONFER_PERMISSION_CHECK_PATH in str(url or "")
+
+    @staticmethod
+    def _truncate_status_msg(value):
+        value = re.sub(r"\s+", " ", str(value or "")).strip()
+        return value[:SEND_DIAGNOSTIC_STATUS_MSG_LIMIT]
+
+    @staticmethod
+    def _is_zero(value):
+        return value in (0, "0")
+
+    @staticmethod
+    def _is_allowed(value):
+        return value in (1, "1", True)
+
+    @staticmethod
+    def _is_denied(value):
+        return value is False or value in (0, "0")
+
+    def _attach_listener(self, event_name, handler):
+        try:
+            self.page.on(event_name, handler)
+            self._listeners.append((event_name, handler))
+        except Exception as exc:
+            logger.warning(
+                f"发送诊断监听器安装失败: {event_name}, {type(exc).__name__}"
+            )
+
+    def start(self):
+        if self._started:
+            return self
+
+        self._started = True
+        self._attach_listener("request", self._on_request)
+        self._attach_listener("response", self._on_response)
+        self._attach_listener("requestfailed", self._on_request_failed)
+        self._attach_listener("requestfinished", self._on_request_finished)
+
+        try:
+            self.page.evaluate(
+                """
+                (key) => {
+                    const previous = window[key];
+
+                    if (previous && typeof previous.cleanup === 'function') {
+                        previous.cleanup();
+                    }
+
+                    const events = {
+                        pointerdown: { count: 0, isTrusted: false },
+                        pointerup: { count: 0, isTrusted: false },
+                        click: { count: 0, isTrusted: false }
+                    };
+                    const eventTypes = Object.keys(events);
+                    const handler = (event) => {
+                        const target = event.target;
+                        const button = target && target.closest
+                            ? target.closest('button.chat-btn')
+                            : null;
+
+                        if (!button || !events[event.type]) return;
+
+                        events[event.type].count += 1;
+                        events[event.type].isTrusted =
+                            events[event.type].isTrusted || event.isTrusted === true;
+                    };
+
+                    eventTypes.forEach((type) => {
+                        document.addEventListener(type, handler, true);
+                    });
+
+                    window[key] = {
+                        events,
+                        cleanup: () => {
+                            eventTypes.forEach((type) => {
+                                document.removeEventListener(type, handler, true);
+                            });
+                        }
+                    };
+                }
+                """,
+                SEND_DIAGNOSTIC_WINDOW_KEY,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"发送按钮事件诊断安装失败: {type(exc).__name__}"
+            )
+
+        return self
+
+    def _on_request(self, request):
+        if not self._is_permission_check(getattr(request, "url", "")):
+            return
+
+        self._permission_events.append(("request", request))
+
+    def _on_response(self, response):
+        if not self._is_permission_check(getattr(response, "url", "")):
+            return
+
+        self._permission_events.append(("response", response))
+
+    def _on_request_finished(self, request):
+        if not self._is_permission_check(getattr(request, "url", "")):
+            return
+
+        self._permission_events.append(("request_finished", request))
+
+    def _apply_response(self, response):
+        http_status = None
+
+        try:
+            http_status = response.status
+        except Exception:
+            pass
+
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {}
+
+        if not isinstance(payload, dict):
+            payload = {}
+
+        status_code = payload.get("status_code")
+        check_result = payload.get("check_result")
+        status_msg = self._truncate_status_msg(payload.get("status_msg"))
+
+        http_ok = (
+            isinstance(http_status, int)
+            and 200 <= http_status < 400
+        )
+
+        if not http_ok or not self._is_zero(status_code):
+            permission_state = "api_error"
+        elif self._is_allowed(check_result):
+            permission_state = "allowed"
+        elif self._is_denied(check_result):
+            permission_state = "permission_denied"
+        else:
+            permission_state = "api_error"
+
+        # Commit one complete response atomically. response.json() yields to
+        # Playwright's dispatcher, so callbacks may queue later events while it
+        # waits for the body.
+        self.http_status = http_status
+        self.status_code = status_code
+        self.check_result = check_result
+        self.status_msg = status_msg
+        self.permission_state = permission_state
+
+        logger.info(
+            "发送诊断: 代运营权限响应 "
+            f"http_status={self.http_status}, "
+            f"status_code={self.status_code}, "
+            f"check_result={self.check_result}, "
+            f"status_msg={self.status_msg!r}"
+        )
+
+    def _on_request_failed(self, request):
+        if not self._is_permission_check(getattr(request, "url", "")):
+            return
+
+        self._permission_events.append(("request_failed", request))
+
+    def refresh(self):
+        """Apply queued Playwright events serially outside event callbacks."""
+        while self._permission_events:
+            event_type, payload = self._permission_events.popleft()
+
+            if event_type == "request":
+                request_key = id(payload)
+
+                if request_key in self._permission_requests:
+                    continue
+
+                self.permission_request_count += 1
+                self._permission_requests[request_key] = {
+                    "request": payload,
+                    "response": None,
+                    "sequence": self.permission_request_count,
+                }
+                self._latest_permission_request_key = request_key
+                self.permission_state = "requested_pending"
+                self.http_status = None
+                self.status_code = None
+                self.check_result = None
+                self.status_msg = ""
+                logger.info("发送诊断: 已观察到代运营权限校验请求")
+                continue
+
+            if event_type == "response":
+                try:
+                    request = payload.request
+                except Exception:
+                    continue
+
+                request_key = id(request)
+                request_state = self._permission_requests.get(request_key)
+
+                if request_state is None:
+                    continue
+
+                request_state["response"] = payload
+
+                if request_key == self._latest_permission_request_key:
+                    try:
+                        self.http_status = payload.status
+                    except Exception:
+                        self.http_status = None
+
+                    self.permission_state = "response_pending"
+
+                continue
+
+            request_key = id(payload)
+            request_state = self._permission_requests.get(request_key)
+
+            if request_state is None:
+                continue
+
+            if request_key != self._latest_permission_request_key:
+                continue
+
+            if event_type == "request_finished":
+                response = request_state.get("response")
+
+                if response is not None:
+                    self._apply_response(response)
+
+                continue
+
+            self.permission_state = "request_failed"
+            self.http_status = None
+            self.status_code = None
+            self.check_result = None
+            self.status_msg = ""
+            logger.warning("发送诊断: 代运营权限校验请求失败")
+
+    def collect_button_events(self):
+        try:
+            snapshot = self.page.evaluate(
+                """
+                (key) => {
+                    const state = window[key];
+
+                    if (!state || !state.events) return null;
+
+                    const snapshot = {};
+
+                    Object.entries(state.events).forEach(([type, value]) => {
+                        snapshot[type] = {
+                            count: Number(value.count || 0),
+                            isTrusted: value.isTrusted === true
+                        };
+                    });
+
+                    return snapshot;
+                }
+                """,
+                SEND_DIAGNOSTIC_WINDOW_KEY,
+            )
+        except Exception:
+            return self.button_events
+
+        if not isinstance(snapshot, dict):
+            return self.button_events
+
+        for event_type in SEND_BUTTON_EVENT_TYPES:
+            value = snapshot.get(event_type)
+
+            if not isinstance(value, dict):
+                continue
+
+            try:
+                count = max(0, int(value.get("count", 0)))
+            except (TypeError, ValueError):
+                count = 0
+
+            current = self.button_events[event_type]
+            current["count"] = max(current["count"], count)
+            current["is_trusted"] = bool(
+                current["is_trusted"] or value.get("isTrusted") is True
+            )
+
+        return self.button_events
+
+    def failure_detail(self):
+        detail_parts = []
+
+        if self.http_status is not None:
+            detail_parts.append(f"HTTP {self.http_status}")
+
+        if self.status_code is not None:
+            detail_parts.append(f"status_code={self.status_code}")
+
+        if self.check_result is not None:
+            detail_parts.append(f"check_result={self.check_result}")
+
+        if self.status_msg:
+            detail_parts.append(f"status_msg={self.status_msg}")
+
+        detail = ", ".join(detail_parts)
+
+        if self.permission_state == "permission_denied":
+            prefix = "代运营账号没有私信权限"
+        elif self.permission_state == "api_error":
+            prefix = "代运营权限校验接口返回异常"
+        elif self.permission_state == "request_failed":
+            prefix = "代运营权限校验请求失败"
+        else:
+            return ""
+
+        return f"{prefix}: {detail}" if detail else prefix
+
+    def raise_if_failed(self):
+        self.refresh()
+        detail = self.failure_detail()
+
+        if detail:
+            raise MessageSendNotConfirmed(detail)
+
+    def summary(self):
+        self.refresh()
+        fields = [f"permission={self.permission_state}"]
+
+        if self.http_status is not None:
+            fields.append(f"http_status={self.http_status}")
+
+        if self.status_code is not None:
+            fields.append(f"status_code={self.status_code}")
+
+        if self.check_result is not None:
+            fields.append(f"check_result={self.check_result}")
+
+        if self.status_msg:
+            fields.append(f"status_msg={self.status_msg}")
+
+        event_summary = ",".join(
+            f"{event_type}:{details['count']}/trusted={details['is_trusted']}"
+            for event_type, details in self.button_events.items()
+        )
+        fields.append(f"button_events={event_summary}")
+        return "; ".join(fields)
+
+    def stop(self):
+        if not self._started:
+            return
+
+        self.refresh()
+        self.collect_button_events()
+
+        try:
+            self.page.evaluate(
+                """
+                (key) => {
+                    const state = window[key];
+
+                    if (!state) return;
+                    if (typeof state.cleanup === 'function') state.cleanup();
+                    delete window[key];
+                }
+                """,
+                SEND_DIAGNOSTIC_WINDOW_KEY,
+            )
+        except Exception:
+            pass
+
+        for event_name, handler in reversed(self._listeners):
+            try:
+                self.page.remove_listener(event_name, handler)
+            except Exception:
+                pass
+
+        # Playwright can dispatch late response/finished events while the
+        # evaluate calls above yield. Remove listeners first, then drain the
+        # events already delivered before clearing request associations.
+        self.refresh()
+        summary = self.summary()
+        self._listeners.clear()
+        self._permission_requests.clear()
+        self._latest_permission_request_key = None
+        self._started = False
+        logger.info(f"发送诊断汇总: {summary}")
 
 
 def normalize_chat_text(value):
@@ -2597,12 +3011,16 @@ def wait_for_message_send_confirmation(
     timeout=25000,
     poll_interval=0.25,
     stable_seconds=3.0,
+    diagnostic_monitor=None,
 ):
     deadline = time.monotonic() + timeout / 1000
     success_since = None
     last_state = {"state": "missing", "detail": "未检测到新增的本人消息气泡"}
 
     while time.monotonic() < deadline:
+        if diagnostic_monitor is not None:
+            diagnostic_monitor.raise_if_failed()
+
         try:
             state = inspect_new_outgoing_message(page, snapshot, message)
         except Exception as exc:
@@ -2612,6 +3030,9 @@ def wait_for_message_send_confirmation(
             }
 
         last_state = state
+
+        if diagnostic_monitor is not None:
+            diagnostic_monitor.raise_if_failed()
 
         if state["state"] in ("failed", "rejected"):
             raise MessageSendNotConfirmed(state["detail"])
@@ -2629,8 +3050,15 @@ def wait_for_message_send_confirmation(
 
         time.sleep(poll_interval)
 
+    diagnostic_summary = ""
+
+    if diagnostic_monitor is not None:
+        diagnostic_monitor.raise_if_failed()
+        diagnostic_monitor.collect_button_events()
+        diagnostic_summary = f"; 发送诊断: {diagnostic_monitor.summary()}"
+
     raise MessageSendNotConfirmed(
-        f"发送结果确认超时: {last_state['detail']}"
+        f"发送结果确认超时: {last_state['detail']}{diagnostic_summary}"
     )
 
 
@@ -2697,29 +3125,40 @@ def send_message_to_friend(page, account_username, friend_name, message):
     # Give React a short moment to enable the button after input.
     time.sleep(1.0)
     send_snapshot = capture_message_send_snapshot(page, message)
-
-    send_method = click_send_or_press_enter(
-        page,
-        account_username,
-        friend_name,
-        chat_input=chat_input,
-        expected_message=message,
-    )
-
-    if not send_method:
-        save_debug_page(page, f"{account_username}_{friend_name}_send_action_failed")
-        raise RuntimeError(f"账号 {account_username} 发送动作失败")
+    diagnostic_monitor = SendAttemptDiagnosticMonitor(page).start()
 
     try:
-        wait_for_message_send_confirmation(page, send_snapshot, message)
-    except MessageSendNotConfirmed as exc:
-        logger.error(
-            f"账号 {account_username} 给好友 {friend_name} 的消息未确认发送成功: {exc}"
+        send_method = click_send_or_press_enter(
+            page,
+            account_username,
+            friend_name,
+            chat_input=chat_input,
+            expected_message=message,
         )
-        save_debug_page(page, f"{account_username}_{friend_name}_send_not_confirmed")
-        raise RuntimeError(
-            f"账号 {account_username} 给好友 {friend_name} 的消息未确认发送成功: {exc}"
-        ) from exc
+
+        diagnostic_monitor.collect_button_events()
+
+        if not send_method:
+            save_debug_page(page, f"{account_username}_{friend_name}_send_action_failed")
+            raise RuntimeError(f"账号 {account_username} 发送动作失败")
+
+        try:
+            wait_for_message_send_confirmation(
+                page,
+                send_snapshot,
+                message,
+                diagnostic_monitor=diagnostic_monitor,
+            )
+        except MessageSendNotConfirmed as exc:
+            logger.error(
+                f"账号 {account_username} 给好友 {friend_name} 的消息未确认发送成功: {exc}"
+            )
+            save_debug_page(page, f"{account_username}_{friend_name}_send_not_confirmed")
+            raise RuntimeError(
+                f"账号 {account_username} 给好友 {friend_name} 的消息未确认发送成功: {exc}"
+            ) from exc
+    finally:
+        diagnostic_monitor.stop()
 
     logger.info(
         f"账号 {account_username} 给好友 {friend_name} 发送消息已确认，发送方式: {send_method}"

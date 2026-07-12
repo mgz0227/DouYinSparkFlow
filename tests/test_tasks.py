@@ -94,6 +94,367 @@ class FakePage:
         raise AssertionError(f"unexpected page selector: {selector}")
 
 
+class FakePermissionRequest:
+    def __init__(self, url=tasks.CONFER_PERMISSION_CHECK_PATH):
+        self.url = url
+
+
+class FakePermissionResponse(FakePermissionRequest):
+    def __init__(
+        self,
+        payload,
+        status=200,
+        url=tasks.CONFER_PERMISSION_CHECK_PATH,
+        on_json=None,
+        request=None,
+    ):
+        super().__init__(url=url)
+        self.status = status
+        self.payload = payload
+        self.on_json = on_json
+        self.request = request
+        self.json_calls = 0
+
+    def json(self):
+        self.json_calls += 1
+
+        if self.on_json is not None:
+            callback = self.on_json
+            self.on_json = None
+            callback()
+
+        if isinstance(self.payload, Exception):
+            raise self.payload
+
+        return self.payload
+
+
+class FakeDiagnosticPage:
+    def __init__(self, button_events=None):
+        self.listeners = {}
+        self.button_events = button_events or {
+            "pointerdown": {"count": 1, "isTrusted": True},
+            "pointerup": {"count": 1, "isTrusted": True},
+            "click": {"count": 1, "isTrusted": True},
+        }
+        self.dom_capture_installed = False
+        self.remove_calls = []
+        self.events_on_collect = []
+
+    def on(self, event_name, handler):
+        self.listeners.setdefault(event_name, []).append(handler)
+
+    def remove_listener(self, event_name, handler):
+        self.listeners[event_name].remove(handler)
+        self.remove_calls.append((event_name, handler))
+
+    def emit(self, event_name, payload):
+        for handler in list(self.listeners.get(event_name, [])):
+            handler(payload)
+
+    def evaluate(self, expression, key):
+        if "delete window[key]" in expression:
+            self.dom_capture_installed = False
+            return None
+
+        if "const snapshot = {}" in expression:
+            pending_events = list(self.events_on_collect)
+            self.events_on_collect.clear()
+
+            for event_name, payload in pending_events:
+                self.emit(event_name, payload)
+
+            if not self.dom_capture_installed:
+                return None
+
+            return self.button_events
+
+        if "document.addEventListener(type, handler, true)" in expression:
+            self.dom_capture_installed = True
+            return None
+
+        raise AssertionError("unexpected diagnostic evaluate call")
+
+
+class SendAttemptDiagnosticMonitorTests(unittest.TestCase):
+    def make_monitor(self, button_events=None):
+        page = FakeDiagnosticPage(button_events=button_events)
+        monitor = tasks.SendAttemptDiagnosticMonitor(page).start()
+        return page, monitor
+
+    def emit_permission_response(
+        self,
+        page,
+        payload,
+        *,
+        status=200,
+        on_json=None,
+        finish=True,
+    ):
+        request = FakePermissionRequest()
+        response = FakePermissionResponse(
+            payload,
+            status=status,
+            on_json=on_json,
+            request=request,
+        )
+        page.emit("request", request)
+        page.emit("response", response)
+
+        if finish:
+            page.emit("requestfinished", request)
+
+        return request, response
+
+    def assert_wait_fails(self, monitor, expected):
+        with applied_patches(
+            patch.object(
+                tasks,
+                "inspect_new_outgoing_message",
+                return_value={"state": "missing", "detail": "没有新增气泡"},
+            ),
+            patch.object(tasks.time, "monotonic", side_effect=[0.0, 0.0, 0.01]),
+            patch.object(tasks.time, "sleep", return_value=None),
+        ):
+            with self.assertRaisesRegex(tasks.MessageSendNotConfirmed, expected):
+                tasks.wait_for_message_send_confirmation(
+                    object(),
+                    {},
+                    "hello",
+                    timeout=5,
+                    poll_interval=0.001,
+                    stable_seconds=0,
+                    diagnostic_monitor=monitor,
+                )
+
+    def test_allowed_permission_preserves_success_path(self):
+        page, monitor = self.make_monitor()
+        self.emit_permission_response(
+            page,
+            {"status_code": 0, "check_result": 1, "status_msg": "ok"},
+        )
+
+        with applied_patches(
+            patch.object(
+                tasks,
+                "inspect_new_outgoing_message",
+                return_value={"state": "success", "detail": "发送成功"},
+            ),
+            patch.object(tasks.time, "monotonic", side_effect=[0.0, 0.0, 0.001]),
+        ):
+            result = tasks.wait_for_message_send_confirmation(
+                object(),
+                {},
+                "hello",
+                timeout=100,
+                stable_seconds=0,
+                diagnostic_monitor=monitor,
+            )
+
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(monitor.permission_state, "allowed")
+        monitor.stop()
+
+    def test_permission_denied_fails_early(self):
+        page, monitor = self.make_monitor()
+        self.emit_permission_response(
+            page,
+            {
+                "status_code": 0,
+                "check_result": 0,
+                "status_msg": "没有代运营权限",
+            },
+        )
+
+        self.assert_wait_fails(monitor, "代运营账号没有私信权限")
+        monitor.stop()
+
+    def test_permission_api_error_fails_early_and_truncates_status_msg(self):
+        page, monitor = self.make_monitor()
+        self.emit_permission_response(
+            page,
+            {
+                "status_code": 4001,
+                "check_result": None,
+                "status_msg": "x" * 300,
+            },
+            status=503,
+        )
+
+        self.assert_wait_fails(monitor, "代运营权限校验接口返回异常")
+        self.assertEqual(
+            len(monitor.status_msg),
+            tasks.SEND_DIAGNOSTIC_STATUS_MSG_LIMIT,
+        )
+        monitor.stop()
+
+    def test_unparseable_permission_response_is_api_error(self):
+        page, monitor = self.make_monitor()
+        self.emit_permission_response(
+            page,
+            ValueError("invalid json"),
+        )
+
+        self.assert_wait_fails(monitor, "代运营权限校验接口返回异常")
+        self.assertEqual(monitor.permission_state, "api_error")
+        monitor.stop()
+
+    def test_permission_request_failure_fails_early(self):
+        page, monitor = self.make_monitor()
+        request = FakePermissionRequest()
+        page.emit("request", request)
+        page.emit("requestfailed", request)
+
+        self.assert_wait_fails(monitor, "代运营权限校验请求失败")
+        monitor.stop()
+
+    def test_unknown_check_result_is_api_error_not_permission_denied(self):
+        page, monitor = self.make_monitor()
+        self.emit_permission_response(
+            page,
+            {"status_code": 0, "status_msg": "schema changed"},
+        )
+
+        self.assert_wait_fails(monitor, "代运营权限校验接口返回异常")
+        monitor.stop()
+
+    def test_response_body_is_not_read_before_request_finished(self):
+        page, monitor = self.make_monitor()
+        _, response = self.emit_permission_response(
+            page,
+            {"status_code": 0, "check_result": 1},
+            finish=False,
+        )
+
+        monitor.refresh()
+
+        self.assertEqual(response.json_calls, 0)
+        self.assertEqual(monitor.permission_state, "response_pending")
+        self.assertIn("permission=response_pending", monitor.summary())
+        monitor.stop()
+
+    def test_unmatched_background_response_is_ignored(self):
+        page, monitor = self.make_monitor()
+        background_request = FakePermissionRequest()
+        response = FakePermissionResponse(
+            {"status_code": 0, "check_result": 0},
+            request=background_request,
+        )
+        page.emit("response", response)
+        page.emit("requestfinished", background_request)
+
+        monitor.refresh()
+
+        self.assertEqual(response.json_calls, 0)
+        self.assertEqual(monitor.permission_request_count, 0)
+        self.assertEqual(monitor.permission_state, "not_observed")
+        monitor.stop()
+
+    def test_reentrant_response_events_are_applied_in_order(self):
+        page, monitor = self.make_monitor()
+
+        def emit_second_attempt():
+            self.emit_permission_response(
+                page,
+                {
+                    "status_code": 0,
+                    "check_result": 0,
+                    "status_msg": "没有代运营权限",
+                },
+            )
+
+        self.emit_permission_response(
+            page,
+            {"status_code": 0, "check_result": 1},
+            on_json=emit_second_attempt,
+        )
+
+        self.assert_wait_fails(monitor, "代运营账号没有私信权限")
+        self.assertEqual(monitor.permission_request_count, 2)
+        monitor.stop()
+
+    def test_pending_permission_is_in_timeout_summary(self):
+        page, monitor = self.make_monitor()
+        page.emit("request", FakePermissionRequest())
+
+        self.assert_wait_fails(monitor, "permission=requested_pending")
+        monitor.stop()
+
+    def test_allowed_permission_is_in_timeout_summary(self):
+        page, monitor = self.make_monitor()
+        self.emit_permission_response(
+            page,
+            {"status_code": 0, "check_result": 1},
+        )
+
+        self.assert_wait_fails(monitor, "permission=allowed")
+        monitor.stop()
+
+    def test_no_permission_observation_is_in_timeout_summary(self):
+        _, monitor = self.make_monitor()
+
+        self.assert_wait_fails(monitor, "permission=not_observed")
+        monitor.stop()
+
+    def test_no_permission_request_does_not_block_success(self):
+        _, monitor = self.make_monitor()
+
+        with applied_patches(
+            patch.object(
+                tasks,
+                "inspect_new_outgoing_message",
+                return_value={"state": "success", "detail": "发送成功"},
+            ),
+            patch.object(tasks.time, "monotonic", side_effect=[0.0, 0.0, 0.001]),
+        ):
+            result = tasks.wait_for_message_send_confirmation(
+                object(),
+                {},
+                "hello",
+                timeout=100,
+                stable_seconds=0,
+                diagnostic_monitor=monitor,
+            )
+
+        self.assertEqual(result["state"], "success")
+        self.assertEqual(monitor.permission_state, "not_observed")
+        monitor.stop()
+
+    def test_stop_removes_listeners_and_button_capture(self):
+        page, monitor = self.make_monitor()
+        monitor.stop()
+        monitor.stop()
+
+        self.assertFalse(page.dom_capture_installed)
+        self.assertEqual(page.listeners["request"], [])
+        self.assertEqual(page.listeners["response"], [])
+        self.assertEqual(page.listeners["requestfailed"], [])
+        self.assertEqual(page.listeners["requestfinished"], [])
+        self.assertEqual(
+            [event_name for event_name, _ in page.remove_calls],
+            ["requestfinished", "requestfailed", "response", "request"],
+        )
+        self.assertIn("click:1/trusted=True", monitor.summary())
+
+    def test_stop_drains_events_delivered_during_button_collection(self):
+        page, monitor = self.make_monitor()
+        request = FakePermissionRequest()
+        response = FakePermissionResponse(
+            {"status_code": 0, "check_result": 1},
+            request=request,
+        )
+        page.emit("request", request)
+        page.events_on_collect = [
+            ("response", response),
+            ("requestfinished", request),
+        ]
+
+        monitor.stop()
+
+        self.assertEqual(response.json_calls, 1)
+        self.assertEqual(monitor.permission_state, "allowed")
+
+
 class MessageConfirmationTests(unittest.TestCase):
     def test_cleared_input_without_new_bubble_is_not_success(self):
         page = FakePage()
@@ -298,6 +659,60 @@ class MessageConfirmationTests(unittest.TestCase):
                 )
 
         input_cleared.assert_not_called()
+
+    def test_button_events_are_collected_before_confirmation_wait(self):
+        page = MagicMock()
+        chat_input = MagicMock()
+        monitor = MagicMock()
+        monitor.start.return_value = monitor
+        order = []
+        monitor.collect_button_events.side_effect = lambda: order.append("collect")
+
+        def wait_for_confirmation(*args, **kwargs):
+            order.append("wait")
+
+        with applied_patches(
+            patch.object(tasks.time, "sleep", return_value=None),
+            patch.object(tasks, "close_popups_and_guides"),
+            patch.object(tasks, "wait_chat_input_ready", return_value=True),
+            patch.object(tasks, "find_chat_input", return_value=chat_input),
+            patch.object(tasks, "type_message_with_real_events", return_value="fill"),
+            patch.object(tasks, "get_editable_text", return_value="hello"),
+            patch.object(
+                tasks,
+                "capture_message_send_snapshot",
+                return_value={
+                    "bubble_count": 0,
+                    "matching_count": 0,
+                    "rejection_tip_count": 0,
+                    "marker": "baseline",
+                },
+            ),
+            patch.object(
+                tasks,
+                "click_send_or_press_enter",
+                return_value="locator_button",
+            ),
+            patch.object(
+                tasks,
+                "wait_for_message_send_confirmation",
+                side_effect=wait_for_confirmation,
+            ),
+            patch.object(
+                tasks,
+                "SendAttemptDiagnosticMonitor",
+                return_value=monitor,
+            ),
+        ):
+            tasks.send_message_to_friend(
+                page,
+                "account",
+                "friend",
+                "hello",
+            )
+
+        self.assertEqual(order, ["collect", "wait"])
+        monitor.stop.assert_called_once_with()
 
 
 class SingleSendActionTests(unittest.TestCase):

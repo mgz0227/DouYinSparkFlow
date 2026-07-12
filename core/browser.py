@@ -98,6 +98,8 @@ def get_browser():
         if hasattr(os, "geteuid") and os.geteuid() == 0:
             launch_args.append("--no-sandbox")
 
+        chrome_process_guard.capture_before_launch()
+
         if chrome_path:
             print(f"使用系统 Chrome：{chrome_path}")
             print(f"headless 模式：{headless}")

@@ -27,6 +27,7 @@ class GetBrowserTests(unittest.TestCase):
         self.browser = MagicMock()
         self.guard = MagicMock()
         self.guard.launch_argument = "--dysf-run-token=test-token"
+        self.guard.capture_before_launch.return_value = None
         owned_process = MagicMock()
         owned_process.pid = 123
         self.guard.capture_after_launch.return_value = [owned_process]
@@ -69,7 +70,43 @@ class GetBrowserTests(unittest.TestCase):
         self.assertEqual(result, (self.playwright, self.browser, self.guard))
         launch_args = self.playwright.chromium.launch.call_args.kwargs["args"]
         self.assertIn(self.guard.launch_argument, launch_args)
+        self.guard.capture_before_launch.assert_called_once_with()
         self.guard.capture_after_launch.assert_called_once_with()
+
+    def test_snapshot_happens_before_chrome_launch(self):
+        events = []
+        self.guard.capture_before_launch.side_effect = lambda: events.append(
+            "snapshot"
+        )
+
+        def launch(**kwargs):
+            events.append("launch")
+            return self.browser
+
+        self.playwright.chromium.launch.side_effect = launch
+
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            browser_module.get_browser()
+
+        self.assertEqual(events, ["snapshot", "launch"])
+
+    def test_snapshot_error_prevents_chrome_launch(self):
+        self.guard.capture_before_launch.side_effect = RuntimeError(
+            "snapshot failed"
+        )
+
+        with ExitStack() as stack:
+            for patcher in self.common_patches():
+                stack.enter_context(patcher)
+            with self.assertRaisesRegex(RuntimeError, "snapshot failed"):
+                browser_module.get_browser()
+
+        self.playwright.chromium.launch.assert_not_called()
+        self.guard.capture_before_close.assert_called_once_with()
+        self.guard.cleanup.assert_called_once_with()
+        self.playwright.stop.assert_called_once_with()
 
     def test_launch_error_without_browser_still_attempts_guard_cleanup(self):
         self.playwright.chromium.launch.side_effect = RuntimeError("launch failed")
@@ -81,6 +118,7 @@ class GetBrowserTests(unittest.TestCase):
                 browser_module.get_browser()
 
         self.guard.capture_before_close.assert_called_once_with()
+        self.guard.capture_before_launch.assert_called_once_with()
         self.guard.cleanup.assert_called_once_with()
         self.playwright.stop.assert_called_once_with()
 
@@ -97,6 +135,7 @@ class GetBrowserTests(unittest.TestCase):
                 browser_module.get_browser()
 
         self.guard.capture_before_close.assert_called_once_with()
+        self.guard.capture_before_launch.assert_called_once_with()
         self.browser.close.assert_called_once_with()
         self.guard.cleanup.assert_called_once_with()
         self.playwright.stop.assert_called_once_with()
