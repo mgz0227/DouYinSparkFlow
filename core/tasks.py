@@ -81,6 +81,18 @@ def save_found_friends(account_username, found_targets):
         logger.exception(f"账号 {account_username} 保存好友列表失败")
 
 
+def raise_if_targets_missing(account_username, remaining_targets):
+    missing_targets = sorted(str(target) for target in remaining_targets if target)
+
+    if not missing_targets:
+        return
+
+    raise RuntimeError(
+        f"账号 {account_username} 搜索结束，仍有以下好友未找到: "
+        f"{', '.join(missing_targets)}"
+    )
+
+
 def check_page_status(page, username):
     """
     Check whether the page may be in login/captcha/security verification state.
@@ -1112,11 +1124,14 @@ def scroll_and_select_user(page, account_username, targets):
 
         if direct_result:
             direct_target_name, direct_matched_target = direct_result
+            remaining_direct_targets = set(targets)
+            remaining_direct_targets.discard(direct_matched_target)
             logger.info(
                 f"账号 {account_username} 已通过文本直点选中目标好友: {direct_target_name}"
             )
             yield direct_target_name
             save_found_friends(account_username, {direct_target_name})
+            raise_if_targets_missing(account_username, remaining_direct_targets)
             return
 
         logger.error(f"账号 {account_username} 未找到好友列表首个元素")
@@ -1338,9 +1353,12 @@ def scroll_and_select_user(page, account_username, targets):
                 save_debug_page(page, f"{account_username}_scroll_container_not_found")
                 break
 
+    raise_if_targets_missing(account_username, remaining_targets)
+
 
 def do_user_task(browser, account_username, cookies, targets):
     context = None
+    primary_error = None
 
     try:
         context = browser.new_context(
@@ -1393,17 +1411,29 @@ def do_user_task(browser, account_username, cookies, targets):
             message = build_message()
             send_message_to_friend(page, account_username, friend_name, message)
 
-    except Exception:
+    except BaseException as exc:
+        primary_error = exc
         logger.exception(f"账号 {account_username} 执行失败")
         raise
 
     finally:
         if context:
-            context.close()
+            try:
+                context.close()
+            except Exception as exc:
+                if primary_error is None:
+                    raise
+
+                logger.error(
+                    f"账号 {account_username} 失败后的浏览上下文清理也出现异常，"
+                    f"保留原始任务错误: {exc}"
+                )
 
 
 def runTasks():
     playwright, browser = get_browser()
+    failures = []
+    primary_error = None
 
     try:
         logger.info("开始执行任务")
@@ -1430,13 +1460,46 @@ def runTasks():
                 do_user_task(browser, account_username, cookies, targets)
                 logger.info(f"账号 {account_username} 任务完成")
 
-            except Exception:
+            except Exception as exc:
                 logger.exception(f"账号 {account_username} 任务失败，继续处理下一个账号")
-                continue
+
+                failures.append((account_username, exc))
+
+        if failures:
+            failure_summary = "; ".join(
+                f"{username}: {type(exc).__name__}: {exc}"
+                for username, exc in failures
+            )
+            raise RuntimeError(
+                f"{len(failures)} 个账号任务失败: {failure_summary}"
+            )
+
+    except BaseException as exc:
+        primary_error = exc
+        raise
 
     finally:
-        browser.close()
-        playwright.stop()
+        cleanup_errors = []
+
+        try:
+            browser.close()
+        except Exception as exc:
+            cleanup_errors.append(f"关闭浏览器失败: {exc}")
+
+        try:
+            playwright.stop()
+        except Exception as exc:
+            cleanup_errors.append(f"停止 Playwright 失败: {exc}")
+
+        if cleanup_errors:
+            cleanup_summary = "; ".join(cleanup_errors)
+
+            if primary_error is None:
+                raise RuntimeError(cleanup_summary)
+
+            logger.error(
+                f"任务失败后的资源清理也出现异常，保留原始任务错误: {cleanup_summary}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2219,7 +2282,7 @@ def click_send_or_press_enter(page, account_username, friend_name, chat_input=No
 
         time.sleep(0.25)
 
-    if not button:
+    if button is None or not is_send_button_enabled(button):
         logger.error(f"账号 {account_username} 未找到可用发送按钮")
         return None
 
@@ -2290,12 +2353,216 @@ def wait_input_cleared(chat_input, timeout=12000):
     return False
 
 
+OUTGOING_MESSAGE_SELECTOR = (
+    "css=#sub-app div[class*='box-content-'] "
+    "div[class*='box-item-'][class*='is-me-']"
+)
+OUTGOING_MESSAGE_TEXT_SELECTOR = "css=[class*='text-item-message-']"
+OUTGOING_MESSAGE_STATUS_SELECTOR = "css=[class*='box-item-message-status-']"
+OUTGOING_MESSAGE_PENDING_SELECTOR = "css=[class*='sending-']"
+CHAT_REJECTION_TIP_SELECTOR = (
+    "css=#sub-app div[class*='box-content-'] "
+    "div[class*='box-item-'][class*='tip-']:visible"
+)
+SEND_BASELINE_ATTRIBUTE = "data-dysf-send-baseline"
+
+
+class MessageSendNotConfirmed(RuntimeError):
+    """Raised when the page never exposes a successful outgoing message state."""
+
+
+def normalize_chat_text(value):
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def normalize_message_for_matching(value):
+    text = normalize_chat_text(value)
+    text = re.sub(r"\[[^\[\]\r\n]{1,32}\]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def message_text_matches(rendered_text, expected_text):
+    rendered = normalize_chat_text(rendered_text)
+    expected = normalize_chat_text(expected_text)
+
+    if rendered == expected:
+        return True
+
+    simplified_expected = normalize_message_for_matching(expected)
+
+    return bool(
+        simplified_expected
+        and normalize_message_for_matching(rendered) == simplified_expected
+    )
+
+
+def visible_locator_count(locator):
+    count = locator.count()
+    visible = 0
+
+    for index in range(count):
+        if locator.nth(index).is_visible(timeout=200):
+            visible += 1
+
+    return visible
+
+
+def outgoing_message_text(bubble):
+    try:
+        text_nodes = bubble.locator(OUTGOING_MESSAGE_TEXT_SELECTOR)
+        count = text_nodes.count()
+    except Exception:
+        return ""
+
+    for index in range(count):
+        node = text_nodes.nth(index)
+
+        try:
+            if node.is_visible(timeout=200):
+                return normalize_chat_text(node.inner_text(timeout=500))
+        except Exception:
+            continue
+
+    return ""
+
+
+def capture_message_send_snapshot(page, message):
+    expected_text = normalize_chat_text(message)
+    bubbles = page.locator(OUTGOING_MESSAGE_SELECTOR)
+    bubble_count = bubbles.count()
+    matching_count = 0
+    marker = f"dysf-{time.time_ns()}"
+
+    for index in range(bubble_count):
+        bubble = bubbles.nth(index)
+
+        if message_text_matches(outgoing_message_text(bubble), expected_text):
+            matching_count += 1
+
+        bubble.evaluate(
+            "(el, marker) => el.setAttribute('data-dysf-send-baseline', marker)",
+            marker,
+        )
+
+    rejection_tips = page.locator(CHAT_REJECTION_TIP_SELECTOR)
+
+    return {
+        "bubble_count": bubble_count,
+        "matching_count": matching_count,
+        "rejection_tip_count": visible_locator_count(rejection_tips),
+        "marker": marker,
+    }
+
+
+def inspect_new_outgoing_message(page, snapshot, message):
+    expected_text = normalize_chat_text(message)
+    bubbles = page.locator(OUTGOING_MESSAGE_SELECTOR)
+    bubble_count = bubbles.count()
+    matching_bubbles = []
+    unmarked_matching_bubbles = []
+    marker = snapshot["marker"]
+
+    for index in range(bubble_count):
+        bubble = bubbles.nth(index)
+
+        if message_text_matches(outgoing_message_text(bubble), expected_text):
+            matching_bubbles.append(bubble)
+
+            if bubble.get_attribute(SEND_BASELINE_ATTRIBUTE) != marker:
+                unmarked_matching_bubbles.append(bubble)
+
+    if (
+        len(matching_bubbles) <= snapshot["matching_count"]
+        or not unmarked_matching_bubbles
+    ):
+        return {"state": "missing", "detail": "未检测到新增的本人消息气泡"}
+
+    candidate = unmarked_matching_bubbles[-1]
+
+    adjacent_tip = candidate.locator(
+        "xpath=following-sibling::*[1][contains(@class, 'box-item-') "
+        "and contains(@class, 'tip-')]"
+    )
+
+    if visible_locator_count(adjacent_tip):
+        try:
+            detail = normalize_chat_text(adjacent_tip.nth(0).inner_text(timeout=500))
+        except Exception:
+            detail = "消息旁出现审核/拒绝提示"
+
+        return {"state": "rejected", "detail": detail or "消息被审核/拒绝"}
+
+    rejection_tip_count = visible_locator_count(
+        page.locator(CHAT_REJECTION_TIP_SELECTOR)
+    )
+
+    if rejection_tip_count > snapshot["rejection_tip_count"]:
+        return {"state": "rejected", "detail": "聊天区域出现新的审核/拒绝提示"}
+
+    status = candidate.locator(OUTGOING_MESSAGE_STATUS_SELECTOR)
+
+    if visible_locator_count(status):
+        pending = candidate.locator(OUTGOING_MESSAGE_PENDING_SELECTOR)
+
+        if visible_locator_count(pending):
+            return {"state": "pending", "detail": "消息仍在发送中"}
+
+        return {"state": "failed", "detail": "消息气泡显示发送失败状态"}
+
+    return {"state": "success", "detail": "消息气泡已进入成功状态"}
+
+
+def wait_for_message_send_confirmation(
+    page,
+    snapshot,
+    message,
+    timeout=25000,
+    poll_interval=0.25,
+    stable_seconds=3.0,
+):
+    deadline = time.monotonic() + timeout / 1000
+    success_since = None
+    last_state = {"state": "missing", "detail": "未检测到新增的本人消息气泡"}
+
+    while time.monotonic() < deadline:
+        try:
+            state = inspect_new_outgoing_message(page, snapshot, message)
+        except Exception as exc:
+            state = {
+                "state": "unknown",
+                "detail": f"读取消息状态时页面发生变化: {exc}",
+            }
+
+        last_state = state
+
+        if state["state"] in ("failed", "rejected"):
+            raise MessageSendNotConfirmed(state["detail"])
+
+        if state["state"] == "success":
+            now = time.monotonic()
+
+            if success_since is None:
+                success_since = now
+
+            if now - success_since >= stable_seconds:
+                return state
+        else:
+            success_since = None
+
+        time.sleep(poll_interval)
+
+    raise MessageSendNotConfirmed(
+        f"发送结果确认超时: {last_state['detail']}"
+    )
+
+
 def send_message_to_friend(page, account_username, friend_name, message):
     """
     Send a message to the currently selected friend/group.
 
     This version verifies the real send button, clicks the real chat-btn, and
-    only reports success when the input is cleared or the message bubble appears.
+    only reports success after the new outgoing bubble reaches a stable success
+    state without a failure status or moderation/rejection tip.
     """
 
     message = str(message or "").strip()
@@ -2351,6 +2618,7 @@ def send_message_to_friend(page, account_username, friend_name, message):
 
     # Give React a short moment to enable the button after input.
     time.sleep(1.0)
+    send_snapshot = capture_message_send_snapshot(page, message)
 
     send_method = click_send_or_press_enter(
         page,
@@ -2363,47 +2631,17 @@ def send_message_to_friend(page, account_username, friend_name, message):
         save_debug_page(page, f"{account_username}_{friend_name}_send_action_failed")
         raise RuntimeError(f"账号 {account_username} 发送动作失败")
 
-    if wait_input_cleared(chat_input, timeout=12000):
-        logger.info(
-            f"账号 {account_username} 给好友 {friend_name} 发送消息完成，发送方式: {send_method}"
+    try:
+        wait_for_message_send_confirmation(page, send_snapshot, message)
+    except MessageSendNotConfirmed as exc:
+        logger.error(
+            f"账号 {account_username} 给好友 {friend_name} 的消息未确认发送成功: {exc}"
         )
-        return
+        save_debug_page(page, f"{account_username}_{friend_name}_send_not_confirmed")
+        raise RuntimeError(
+            f"账号 {account_username} 给好友 {friend_name} 的消息未确认发送成功: {exc}"
+        ) from exc
 
-    # Last rescue: the button may have been enabled after first click but not fired.
-    # Try dispatch and Enter once more before failing.
-    logger.warning(f"账号 {account_username} 第一次发送后输入框未清空，执行二次发送兜底")
-
-    try:
-        button = find_send_button(page)
-        if button and is_send_button_enabled(button):
-            dispatch_button_events(button)
-            time.sleep(1.5)
-
-            if wait_input_cleared(chat_input, timeout=6000):
-                logger.info(
-                    f"账号 {account_username} 二次 JS 事件发送成功: {friend_name}"
-                )
-                return
-    except Exception:
-        pass
-
-    try:
-        chat_input.click(timeout=5000)
-        page.keyboard.press("Enter")
-        time.sleep(1.5)
-
-        if wait_input_cleared(chat_input, timeout=6000):
-            logger.info(
-                f"账号 {account_username} 二次 Enter 发送成功: {friend_name}"
-            )
-            return
-    except Exception:
-        pass
-
-    logger.error(
-        f"账号 {account_username} 发送后输入框未清空，可能没有真正发出去"
-    )
-    save_debug_page(page, f"{account_username}_{friend_name}_send_not_confirmed")
-    raise RuntimeError(
-        f"账号 {account_username} 发送后输入框未清空，未确认发送成功"
+    logger.info(
+        f"账号 {account_username} 给好友 {friend_name} 发送消息已确认，发送方式: {send_method}"
     )
